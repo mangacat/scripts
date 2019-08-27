@@ -4,14 +4,13 @@
 
 """MangaCat Manager"""
 
-from __future__ import print_function
-
-import argparse
+import aiohttp as http
+import argparse as ap
+import itertools as it
 import imghdr
 import logging
-import mimetypes
+import typing as t
 import os
-import requests
 import sys
 
 
@@ -19,7 +18,7 @@ import sys
 # Constants #
 #############
 
-__version__ = '0.0.1'
+__version__ = '0.0.2'
 
 API = 'https://api.manga.cat/v1'
 LOGIN = '/auth/login'
@@ -168,7 +167,7 @@ LANGUAGES = (
 # Logging #
 ###########
 
-_logger = logging.getLogger('urllib3')
+_logger = logging.getLogger('aiohttp.client')
 logging.basicConfig(stream=sys.stderr, level=logging.WARN,
                     format='%(levelname)s: %(message)s')
 logging.captureWarnings(True)
@@ -178,7 +177,7 @@ logging.captureWarnings(True)
 # Formatters #
 ##############
 
-class ArgFormatter(argparse.HelpFormatter):
+class ArgFormatter(ap.HelpFormatter):
     def __init__(self, prog):
         super(ArgFormatter, self).__init__(
             prog, max_help_position=40, width=80
@@ -199,7 +198,7 @@ class ArgFormatter(argparse.HelpFormatter):
     def _get_help_string(self, action):
         help = action.help
         if '%(default)' not in action.help:
-            if action.default not in (argparse.SUPPRESS, None):
+            if action.default not in (ap.SUPPRESS, None):
                 if action.option_strings or action.nargs in ('*', '+'):
                     help += ' (default: %(default)s)'
         return help
@@ -209,7 +208,7 @@ class ArgFormatter(argparse.HelpFormatter):
 # Types #
 #########
 
-class ImageType(argparse.FileType):
+class ImageType(ap.FileType):
     def __init__(self, bufsize=-1, encoding=None, errors=None):
         super(ImageType, self).__init__('rb', bufsize, encoding, errors)
 
@@ -220,22 +219,11 @@ class ImageType(argparse.FileType):
             if tf(head, img):
                 img.seek(0)
                 return img
-        msg = '"%s" is not a valid image file'
-        raise argparse.ArgumentTypeError(msg % string)
+        msg = f'"{string}" is not a valid image file'
+        raise ap.ArgumentTypeError(msg)
 
 
-class URLType(object):
-    def __call__(self, string):
-        try:
-            requests.adapters.parse_url(string)
-        except requests.exceptions.InvalidURL:
-            msg = '"%s" is not a valid URL'
-            raise argparse.ArgumentTypeError(msg % string)
-        else:
-            return string
-
-
-class PositiveNumberType(object):
+class PositiveNumberType:
     def __init__(self, zero=True, ntype=float):
         self.min = ntype(zero)
         self.ntype = ntype
@@ -245,12 +233,12 @@ class PositiveNumberType(object):
             if self.ntype(string) < self.min:
                 raise ValueError()
         except ValueError:
-            msg = '"%s" is not a positive number'
-            raise argparse.ArgumentTypeError(msg % string)
+            msg = f'"{string}" is not a positive number'
+            raise ap.ArgumentTypeError(msg)
         return self.ntype(string)
 
 
-class DateTimeType(object):
+class DateTimeType:
     def __call__(self, string):
         from datetime import datetime
         if not string:
@@ -258,8 +246,8 @@ class DateTimeType(object):
         try:
             d = datetime.fromisoformat(string)
         except ValueError:
-            msg = '"%s" is not a valid ISO date-time'
-            raise argparse.ArgumentTypeError(msg % string)
+            msg = f'"{string}" is not a valid ISO date-time'
+            raise ap.ArgumentTypeError(msg)
         else:
             return d.isoformat()
 
@@ -268,28 +256,28 @@ class DateTimeType(object):
 # Actions #
 ###########
 
-class ImageAction(argparse.Action):
+class ImageAction(ap.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         for val in values:
             try:
                 if not imghdr.what(val):
                     values.remove(val)
-                    _logger.debug('Ignoring file "%s".' % val)
+                    _logger.debug(f'Ignoring file "{val}".')
             except OSError as err:
                 if err.errno == 21:
-                    _logger.debug('Ignoring directory "%s".' % val)
+                    _logger.debug(f'Ignoring directory "{val}".')
                 else:
                     raise err
         setattr(namespace, self.dest, values)
 
 
-class CredentialsAction(argparse.Action):
+class CredentialsAction(ap.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         from getpass import getpass
         if isinstance(values, list):
             if len(values) > 3:
                 msg = 'cannot have more than 3 values'
-                raise argparse.ArgumentError(self, msg)
+                raise ap.ArgumentError(self, msg)
             creds = (
                 self._get_input(values, 0, input, 'E-mail'),
                 self._get_input(values, 1, input, 'Username', True),
@@ -300,18 +288,19 @@ class CredentialsAction(argparse.Action):
         setattr(namespace, self.dest, creds)
 
     @staticmethod
-    def _get_input(values, n, func, prompt, empty=False):
+    def _get_input(values: t.List[str], n: int, func: t.Callable,
+                   prompt: str, empty: bool = False) -> t.Optional[str]:
         if len(values) > n:
             return values[n]
         while True:
-            result = func('%s: ' % prompt)
+            result = func(f'{prompt}: ')
             if empty or result != '':
                 return result
             else:
-                sys.stderr.write('%s cannot be empty!\n' % prompt)
+                sys.stderr.write(f'{prompt} cannot be empty!\n')
 
 
-class NetrcAction(argparse.Action):
+class NetrcAction(ap.Action):
     _default_path = os.getenv('NETRC', os.path.expanduser('~/.netrc'))
 
     def __call__(self, parser, namespace, values, option_string=None):
@@ -322,7 +311,7 @@ class NetrcAction(argparse.Action):
             creds = netrc(netrc_file).hosts['manga.cat']
         except KeyError:
             msg = 'no "manga.cat" machine found in netrc file'
-            raise argparse.ArgumentError(self, msg)
+            raise ap.ArgumentError(self, msg)
         else:
             setattr(namespace, self.dest, creds)
 
@@ -331,7 +320,7 @@ class NetrcAction(argparse.Action):
 # Parsers #
 ###########
 
-def _login_parser(parent):
+def _login_parser(parent: ap._SubParsersAction) -> ap.ArgumentParser:
     parser = parent.add_parser('login', formatter_class=ArgFormatter,
                                help='log into manga.cat')
     auth = _reorder_groups(parser, 'authentication arguments')[0]
@@ -346,8 +335,8 @@ def _login_parser(parent):
     return parser
 
 
-def _series_parser(parent):
-    def subcommand_add(commands):
+def _series_parser(parent: ap._SubParsersAction) -> ap.ArgumentParser:
+    def subcommand_add(commands: ap._SubParsersAction) -> None:
         add = commands.add_parser('add', formatter_class=ArgFormatter,
                                   help='add a new series')
         req, opt = _reorder_groups(add)
@@ -377,7 +366,7 @@ def _series_parser(parent):
         opt.add_argument('-t', '--tags', nargs='+', choices=TAGS,
                          metavar='{%s}...' % ','.join(TAGS),
                          help='some tags for the series')
-        opt.add_argument('-r', '--raw', metavar='RAW_URL', type=URLType(),
+        opt.add_argument('-r', '--raw', metavar='RAW_URL',
                          help='the URL to the raw version of the series')
         opt.add_argument('--mu-id', metavar='MU_ID', type=int,
                          help='the ID of the series on MangaUpdates')
@@ -396,8 +385,8 @@ def _series_parser(parent):
     return parser
 
 
-def _chapters_parser(parent):
-    def subcommand_add(commands):
+def _chapters_parser(parent: ap._SubParsersAction) -> ap.ArgumentParser:
+    def subcommand_add(commands: ap._SubParsersAction) -> None:
         add = commands.add_parser('add', formatter_class=ArgFormatter,
                                   help='add a new chapter')
         req, opt = _reorder_groups(add)
@@ -427,11 +416,12 @@ def _chapters_parser(parent):
                          type=PositiveNumberType(ntype=int),
                          metavar='VOLUME_NUMBER', default=0,
                          help='the volume number of the chapter')
+        opt.add_argument('-H', '--hidden',
+                         default=False, action='store_true',
+                         help='set to hide the chapter')
         opt.add_argument('-l', '--language',
                          default='English', choices=LANGUAGES,
                          help='the language of the translation')
-        opt.add_argument('-d', '--delay', type=DateTimeType(),
-                         help='the chapter delay in ISO date-time format')
 
     parser = parent.add_parser('chapters', formatter_class=ArgFormatter,
                                help='manage chapters')
@@ -441,10 +431,10 @@ def _chapters_parser(parent):
     return parser
 
 
-def get_parser():
-    parser = argparse.ArgumentParser(description=__doc__)
+def get_parser() -> ap.ArgumentParser:
+    parser = ap.ArgumentParser(description=__doc__)
     parser.add_argument('-V', '--version', action='version',
-                        version='%s v%s' % (__doc__, __version__))
+                        version=f'{__doc__} v{__version__}')
     parser.add_argument('-v', '--verbose', action='count', default=0,
                         help='increase the verbosity level (up to 2)')
     commands = parser.add_subparsers(title='commands', dest='command')
@@ -459,7 +449,7 @@ def get_parser():
 # Helpers #
 ###########
 
-def _test_extra(h, f):
+def _test_extra(h: bytes, _) -> t.Optional[str]:
     if h[:12] == b'\x00\x00\x00\x0CjP  \x0D\x0A\x87\x0A':
         return 'jp2'
     if h[:4] == b'\xFF\x4F\xFF\x51':
@@ -471,140 +461,118 @@ def _test_extra(h, f):
 imghdr.tests.append(_test_extra)
 
 
-def _reorder_groups(parser, title='required arguments'):
+def _reorder_groups(parser: ap.ArgumentParser, title: str =
+                    'required arguments') -> t.List[ap._ArgumentGroup]:
     parser.add_argument_group(title=title)
     parser._action_groups.insert(1, parser._action_groups.pop())
     return parser._action_groups[1:]
 
 
-def _post_json(url, data, token=None):
-    headers = {
-        'Content-Type': 'application/json; charset=utf-8',
-        'User-Agent': 'mcmanager.py/%s' % __version__,
-    }
-    if token:
-        headers['Authorization'] = 'Bearer %s' % token
-
-    req = requests.post(url, json=data, headers=headers)
-    try:
-        res = req.json()
-    except ValueError:
-        _logger.error(req.content)
-    except requests.exceptions.HTTPError as err:
-        _logger.error('%(code)s - %(msg)s' % err.__dict__)
-    else:
-        _logger.debug(res)
-        return res
+async def _post_json(session: http.ClientSession,
+                     url: str, data: t.Dict, token: str = None) -> str:
+    headers = {'Authorization': f'Bearer {token}'} if token else {}
+    async with session.post(url, json=data, headers=headers) as res:
+        try:
+            body = await res.json()
+        except http.ContentTypeError:
+            _logger.error(await res.text())
+        except http.ClientError as err:
+            _logger.error(f'{err.status} - {err.message}')
+        else:
+            _logger.debug(body)
+            return body
 
 
-# TODO: make this shit work
-def _post_multipart(url, data, files, token=None):
-    headers = {
-        'User-Agent': 'mcmanager.py/%s' % __version__,
-        'Transfer-Encoding': 'chunked',
-    }
-    if token:
-        headers['Authorization'] = 'Bearer %s' % token
+async def _post_files(session: http.ClientSession, url: str,
+                      files: t.List[os.PathLike], token: str = None) -> int:
+    headers = {'Authorization': f'Bearer {token}'} if token else {}
+    # TODO: maybe make these concurrent?
+    for chunk in it.zip_longest(*[iter(files)] * 5):
+        chunk = list(filter(None.__ne__, chunk))
+        form = http.FormData()
+        for f in chunk:
+            form.add_field('data', open(f, 'rb'))
 
-    req = requests.post(url, data=data, files=files, headers=headers)
-    try:
-        res = req.content
-    except requests.exceptions.HTTPError as err:
-        _logger.error('%(code)s - %(msg)s' % err.__dict__)
-    else:
-        return res
+        _logger.info(f'Uploading files: {", ".join(chunk)}')
+        async with session.post(url, data=form, headers=headers) as res:
+            try:
+                body = await res.text()
+                if not body:
+                    _logger.error('Empty response')
+                    return 1
+                _logger.debug(body)
+            except http.ClientError as err:
+                _logger.error(f'{err.status} - {err.message}')
+    return 0
 
 
 ############
 # Commands #
 ############
 
-def login(args):
-    if isinstance(args, dict):
-        args = argparse.Namespace(**args)
+async def login(args: ap.Namespace, session: http.ClientSession) -> int:
     creds = args.credentials or args.netrc
-
-    res = _post_json(API + LOGIN, {
+    data = {
         'confirmed_password': creds[2],
         'email': creds[0],
         'password': creds[2],
         'username': creds[1]
-    })
+    }
+
+    res = await _post_json(session, API + LOGIN, data)
     if not res:
         _logger.error('Empty response')
         return 1
-    print("Authentication token: %s" % res['user']['token'])
+
+    print(f'Authentication token: {res["user"]["token"]}')
+    return 0
 
 
-def series_add(args):
-    if isinstance(args, dict):
-        args = argparse.Namespace(**args)
+async def series_add(args: ap.Namespace, session: http.ClientSession) -> int:
     # TODO: implement this
     raise NotImplementedError()
 
 
-def chapters_add(args):
-    if isinstance(args, dict):
-        args = argparse.Namespace(**args)
-    if args.groups:
-        args.groups = [{'name': g} for g in args.groups]
+async def chapters_add(args: ap.Namespace, session: http.ClientSession) -> int:
     data = {
         'title': args.title,
-        'series': args.series,
-        'number_absolute': args.number_absolute,
-        'number_volume': args.number_volume,
-        'volume_number': args.volume_number,
-        'groups': args.groups,
-        'delay': args.delay,
+        'series': {'id': args.series},
+        'number_absolute': str(args.number_absolute),
+        'number_volume': str(args.number_volume),
+        'volume_number': str(args.volume_number),
+        'groups': [{'name': g} for g in args.groups],
         'language': args.language,
+        'published': not args.hidden,
     }
-    files = []
-    for img in args.files:
-        with open(img, 'rb') as f:
-            mime = mimetypes.guess_type(img)[0]
-            files.append(('files', (
-                os.path.split(img)[-1],
-                f.read(),
-                mime or 'application/octet-stream'
-            )))
 
-    res = _post_multipart(API + CHAPTERS, data, files, args.token)
+    res = await _post_json(session, API + CHAPTERS, data, args.token)
     if not res:
-        _logger.error('Empty response')
+        _logger.error('Empty response.')
         return 1
-    try:
-        print('Added chapter with ID: %d' % res)
-    except TypeError:
-        _logger.error(res)
-        return 1
+
+    url = f'{API}{CHAPTERS}/{res["id"]}'
+    ret = await _post_files(session, url, args.files, args.token)
+
+    print(f'Added chapter with ID: {res["id"]}')
+    return ret
 
 
 ########
 # Main #
 ########
 
-def main(args, parser=get_parser()):
-    # parse verbosity before other arguments
-    verbosity = sum(
-        a.count('v') for a in
-        filter(lambda a: a == '--verbose' or a[:2] == '-v', args)
-    )
-    _logger.setLevel(_logger.level - verbosity * 10)
+async def main(args: t.List[str], parser: ap.ArgumentParser) -> int:
     args = parser.parse_args(args=args)
-    if args.command == 'login':
-        return login(args)
-    elif args.command == 'series':
-        # TODO: add edit & delete
-        return {
-            'add': series_add,
-        }.get(args.subcommand)(args)
-    elif args.command == 'chapters':
-        # TODO: add edit & delete
-        return {
-            'add': chapters_add,
-        }.get(args.subcommand)(args)
-    # TODO: add people & groups
+    _logger.setLevel(_logger.level - args.verbose * 10)
 
+    headers = {'User-Agent': f'mcmanager.py/{__version__}'}
+    async with http.ClientSession(headers=headers) as session:
+        if args.command == 'login':
+            return await login(args, session)
+        else:
+            func = f'{args.command}_{args.subcommand}'
+            return await globals()[func](args, session)
+    return 3
 
 if __name__ == '__main__':
     parser = get_parser()
@@ -613,4 +581,5 @@ if __name__ == '__main__':
     except ImportError:
         pass
     finally:
-        sys.exit(main(sys.argv[1:], parser))
+        from asyncio import run
+        sys.exit(run(main(sys.argv[1:], parser)))

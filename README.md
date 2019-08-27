@@ -2,7 +2,8 @@
 
 ## `mcmanager.py`
 
-Manage MangaCat from the command-line. Requires [python-requests](https://2.python-requests.org/en/master/).
+Manage MangaCat from the command-line.
+Requires Python 3.6+ and [aiohttp](https://aiohttp.readthedocs.io/en/stable/index.html).
 
 * [x] Login
 * [ ] Series
@@ -10,7 +11,7 @@ Manage MangaCat from the command-line. Requires [python-requests](https://2.pyth
   * [ ] Edit
   * [ ] Delete
 * [ ] Chapters
-  * [ ] Add
+  * [x] Add
   * [ ] Edit
   * [ ] Delete
 * [ ] People
